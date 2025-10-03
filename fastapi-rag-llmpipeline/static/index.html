@@ -1,0 +1,79 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Test Chat Stream</title>
+<div>
+  <label>Session ID:</label>
+  <input id="sid" value="sess_92ef57f4a05d4ad6aa05d2a3c12fccc6" style="width:420px" />
+</div>
+<div>
+  <label>Question:</label>
+  <input id="q" value="What features does the AeroBrew Machine offer?" style="width:420px" />
+</div>
+<button id="start">Start Stream</button>
+<button id="stop" disabled>Stop</button>
+
+<pre id="events" style="border:1px solid #ccc; padding:8px; height:260px; overflow:auto"></pre>
+
+<script>
+let es = null;
+
+const $ = (id) => document.getElementById(id);
+const log = (t) => { const p = $("events"); p.textContent += t + "\n"; p.scrollTop = p.scrollHeight; };
+
+$("start").onclick = () => {
+  if (es) { log("[info] stream already running"); return; }
+
+  const sid = $("sid").value.trim();
+  const q   = encodeURIComponent($("q").value.trim());
+  const url = `/sessions/${sid}/message-stream?q=${q}&temperature=0.2&top_k=6`;
+
+  log(`[open] connecting to ${url}`);
+  es = new EventSource(url);
+
+  $("start").disabled = true;
+  $("stop").disabled = false;
+
+  es.addEventListener("opener", (e) => {
+    log(`[opener] ${e.data}`);
+  });
+
+  // You said you don't want retrieval events anymore, so don't listen for them.
+
+  es.addEventListener("final", (e) => {
+    log(`[final] ${e.data}`);
+  });
+
+  es.addEventListener("done", () => {
+    log("[done] closing");
+    es.close();
+    es = null;
+    $("start").disabled = false;
+    $("stop").disabled = true;
+  });
+
+  es.onerror = (e) => {
+    // This fires on network errors or bad SSE format
+    log("[error] stream error — closing to prevent auto-reconnect storm");
+    if (es) {
+      es.close();
+      es = null;
+    }
+    $("start").disabled = false;
+    $("stop").disabled = true;
+  };
+
+  es.onopen = () => {
+    log("[open] connected");
+  };
+};
+
+$("stop").onclick = () => {
+  if (es) {
+    log("[stop] manual close");
+    es.close();
+    es = null;
+  }
+  $("start").disabled = false;
+  $("stop").disabled = true;
+};
+</script>

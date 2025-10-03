@@ -1,0 +1,41 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pyi
+.env
+.env.*
+.venv/
+venv/
+env/
+*.egg-info/
+*.eggs/
+.pytest_cache/
+.mypy_cache/
+
+# Node.js outputs
+node_modules/
+dist/
+build/
+coverage/
+.npm/
+yarn-error.log*
+yarn-debug.log*
+npm-debug.log*
+pnpm-debug.log*
+
+# Project-specific
+logs/
+voicebot-frontend/web/dist/
+voicebot-frontend/web/.vite/
+voicebot-nodejs-backend/cpp
+voicebot-nodejs-backend/models
+
+# OS / Editor junk
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
