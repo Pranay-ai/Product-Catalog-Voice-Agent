@@ -153,7 +153,7 @@ async def message_stream(
                 break
 
             # Yield a dict; EventSourceResponse will format "event:" and "data:" for you
-            yield {"event": name, "data": data}
+            yield {"event": name, "data": data["text"]}
 
             # If we sent "done", just exit cleanly
             if name == "done":

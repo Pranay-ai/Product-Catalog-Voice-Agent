@@ -25,6 +25,136 @@ const BYTES_PER_S = SAMPLE_RATE * 2; // mono 16-bit
 const SEG_MS = Number(process.env.SEG_MS || 8000); // segment size for Whisper
 const SEG_BYTES = Math.floor((SEG_MS / 1000) * BYTES_PER_S);
 const TEMP_PREFIX = "vb_";
+const MIN_TRANSCRIPT_WORDS = Number(process.env.MIN_TRANSCRIPT_WORDS || 5);
+
+// ------------------ LOGGING ------------------
+const LOG_SCOPE = "VoiceBackend";
+const DEBUG_ENABLED =
+  (process.env.LOG_LEVEL || "debug").toLowerCase() === "debug";
+
+function toLogDetails(details = {}) {
+  return Object.entries(details)
+    .map(([k, v]) => {
+      if (v === undefined) return `${k}=undefined`;
+      if (v === null) return `${k}=null`;
+      if (v instanceof Error) {
+        return `${k}=${v.message}`;
+      }
+      if (typeof v === "object") {
+        try {
+          return `${k}=${JSON.stringify(v)}`;
+        } catch (err) {
+          return `${k}=[unstringifiable]`;
+        }
+      }
+      return `${k}=${v}`;
+    })
+    .join(" ");
+}
+
+const NON_SPEECH_NORMALIZED = new Set([
+  "noise",
+  "backgroundnoise",
+  "backgroundsound",
+  "background",
+  "silence",
+  "music",
+  "inaudible",
+  "unintelligible",
+  "applause",
+  "laughter",
+  "laughing",
+  "cough",
+  "coughing",
+  "breath",
+  "breathing",
+  "click",
+  "clicking",
+  "clicks",
+  "sigh",
+  "sighing",
+  "ambient",
+  "ambientnoise",
+  "ambientmusic",
+  "sound",
+  "sounds",
+  "...",
+  "…",
+]);
+
+function normalizeWhisperText(rawText) {
+  if (!rawText) return "";
+  let trimmed = String(rawText).trim();
+  if (!trimmed) return "";
+
+  // Remove bracketed/parenthetical annotations entirely.
+  trimmed = trimmed.replace(/\[[^\]]*\]/g, " ");
+  trimmed = trimmed.replace(/\([^)]*\)/g, " ");
+  trimmed = trimmed.replace(/\{[^}]*\}/g, " ");
+
+  trimmed = trimmed.replace(/\s+/g, " ").trim();
+  if (!trimmed) return "";
+
+  // If there are no letters or digits, treat as noise (e.g. "...", "[???]").
+  if (!/[a-z0-9]/i.test(trimmed)) {
+    return "";
+  }
+
+  const lower = trimmed.toLowerCase();
+
+  if (lower.startsWith("[") && lower.endsWith("]")) {
+    const inner = lower.slice(1, -1).replace(/[^a-z0-9]+/g, "");
+    if (!inner) return "";
+    if (NON_SPEECH_NORMALIZED.has(inner)) return "";
+  }
+
+  const collapsed = lower.replace(/[^a-z0-9]+/g, "");
+  if (NON_SPEECH_NORMALIZED.has(collapsed)) return "";
+
+  return trimmed;
+}
+
+function countWords(text) {
+  if (!text) return 0;
+  return text
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+function logInfo(message, details) {
+  const ts = new Date().toISOString();
+  const extra = details ? ` ${toLogDetails(details)}` : "";
+  console.log(`[${ts}] ${LOG_SCOPE} ${message}${extra}`);
+}
+
+function logDebug(message, details) {
+  if (!DEBUG_ENABLED) return;
+  logInfo(message, details);
+}
+
+function logError(message, error, details) {
+  const ts = new Date().toISOString();
+  const payload = {
+    ...(details || {}),
+    error: error && error instanceof Error ? error.message : error,
+  };
+  console.error(`[${ts}] ${LOG_SCOPE} ${message} ${toLogDetails(payload)}`);
+  if (error instanceof Error && error.stack) {
+    console.error(error.stack);
+  }
+}
+
+process.on("uncaughtException", (err) => {
+  logError("uncaughtException", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  logError(
+    "unhandledRejection",
+    reason instanceof Error ? reason : new Error(String(reason))
+  );
+});
 
 // ------------------ HELPERS ------------------
 function appendBytes(dst, src) {
@@ -69,7 +199,7 @@ function writeWav16kMonoPCM16(pcmBytes, outPath) {
   return outPath;
 }
 function spawnWhisperOnce(wavPath) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const args = [
       "-m",
       WHISPER_MODEL,
@@ -81,16 +211,62 @@ function spawnWhisperOnce(wavPath) {
       "-f",
       wavPath,
     ];
+    const start = Date.now();
+    logDebug("Whisper spawn", { wavPath, args: args.join(" ") });
     const proc = spawn(WHISPER_BIN, args, {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
-    proc.stdout.on("data", (d) => (out += d.toString()));
-    proc.on("close", () => {
+    let errBuf = "";
+
+    proc.stdout.on("data", (d) => {
+      out += d.toString();
+    });
+
+    proc.stderr.on("data", (d) => {
+      errBuf += d.toString();
+    });
+
+    proc.on("error", (err) => {
+      const durationMs = Date.now() - start;
       try {
         fs.unlinkSync(wavPath);
       } catch {}
-      resolve((out || "").trim());
+      logError("Whisper process spawn error", err, { wavPath, durationMs });
+      reject(err);
+    });
+
+    proc.on("close", (code, signal) => {
+      const durationMs = Date.now() - start;
+      try {
+        fs.unlinkSync(wavPath);
+      } catch {}
+
+      if (code !== 0) {
+        const err = new Error(
+          `Whisper exited with code ${code}${signal ? ` signal ${signal}` : ""}`
+        );
+        logError("Whisper non-zero exit", err, {
+          wavPath,
+          code,
+          signal,
+          durationMs,
+          stderr: errBuf.trim(),
+        });
+        reject(err);
+        return;
+      }
+
+      const text = (out || "").trim();
+      if (errBuf.trim()) {
+        logDebug("Whisper stderr", { wavPath, stderr: errBuf.trim() });
+      }
+      logDebug("Whisper completed", {
+        wavPath,
+        durationMs,
+        textPreview: text.slice(0, 80),
+      });
+      resolve(text);
     });
   });
 }
@@ -125,9 +301,27 @@ function resetTranscriptionBuffers(st, { resetSessionId = false } = {}) {
 
 // ------------------ FASTAPI BRIDGE ------------------
 async function createFastapiSession() {
-  const res = await fetch(`${FASTAPI_BASE}/sessions`, { method: "POST" });
-  if (!res.ok) throw new Error(`Session create failed: ${res.status}`);
+  logDebug("Creating FastAPI session");
+  let res;
+  try {
+    res = await fetch(`${FASTAPI_BASE}/sessions`, { method: "POST" });
+  } catch (err) {
+    logError("FastAPI session request failed", err, { baseUrl: FASTAPI_BASE });
+    throw err;
+  }
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "<failed-to-read-body>");
+    const err = new Error(`Session create failed: ${res.status}`);
+    logError("FastAPI session create non-200", err, {
+      status: res.status,
+      statusText: res.statusText,
+      body: text,
+    });
+    throw err;
+  }
   const body = await res.json();
+  logDebug("FastAPI session created", { sessionId: body.id });
   return body.id;
 }
 
@@ -136,23 +330,26 @@ function pipeLLM({ sessionId, question, ws }) {
     `${FASTAPI_BASE}/sessions/${encodeURIComponent(sessionId)}/message-stream` +
     `?q=${encodeURIComponent(question)}`;
 
-  console.log(`[LLM] SSE OPEN ${url}`);
+  logDebug("SSE open", { url, sessionId });
   const es = new EventSource(url);
 
   es.onopen = () => {
-    console.log(`[LLM] SSE CONNECTED session=${sessionId}`);
+    logDebug("SSE connected", { sessionId });
     try {
       ws?.send(JSON.stringify({ type: "llm", event: "open" }));
     } catch (err) {
-      console.log(`[LLM] SSE open send failed`, err?.message || err);
+      logError("SSE open send failed", err, { sessionId });
     }
   };
   es.onerror = (err) => {
-    console.log("[LLM] SSE error", err?.message || err);
+    logError("SSE error", err instanceof Error ? err : new Error(String(err)), {
+      sessionId,
+      questionPreview: question.slice(0, 120),
+    });
     try {
       ws?.send(JSON.stringify({ type: "llm", event: "error" }));
     } catch (sendErr) {
-      console.log(`[LLM] SSE error send failed`, sendErr?.message || sendErr);
+      logError("SSE error send failed", sendErr, { sessionId });
     }
     try {
       es.close();
@@ -171,9 +368,11 @@ function pipeLLM({ sessionId, question, ws }) {
         } catch (parseErr) {
           data = raw;
           const preview = raw.length > 200 ? `${raw.slice(0, 200)}…` : raw;
-          console.log(
-            `[LLM] SSE ${evt} non-JSON payload (len=${raw.length}): ${preview}`
-          );
+          logDebug(`SSE ${evt} non-JSON payload`, {
+            sessionId,
+            rawLength: raw.length,
+            preview,
+          });
         }
       }
       const msg = {
@@ -181,13 +380,15 @@ function pipeLLM({ sessionId, question, ws }) {
         event: evt,
         data,
       };
-      console.log(
-        `[LLM] SSE ${evt} -> WS (${parsed ? "json" : raw ? "text" : "empty"})`
-      );
+      logDebug(`SSE ${evt} -> WS`, {
+        sessionId,
+        parsed,
+        hasRaw: Boolean(raw),
+      });
       try {
         ws?.send(JSON.stringify(msg));
       } catch (sendErr) {
-        console.log(`[LLM] SSE ${evt} send failed`, sendErr?.message || sendErr);
+        logError(`SSE ${evt} send failed`, sendErr, { sessionId });
       }
       if (evt === "done") {
         try {
@@ -241,7 +442,7 @@ server.on("upgrade", (req, socket, head) => {
 
 // CONTROL WS: JSON only
 wssControl.on("connection", (ws, _req, cid) => {
-  console.log(`[CTRL ${cid}] OPEN`);
+  logDebug("CTRL connection open", { cid });
   let st = clients.get(cid);
   if (!st) {
     st = newSessionState();
@@ -261,17 +462,18 @@ wssControl.on("connection", (ws, _req, cid) => {
       try {
         st.sessionId = await createFastapiSession();
         ws.send(JSON.stringify({ type: "ack", sessionId: st.sessionId }));
-        console.log(`[CTRL ${cid}] START -> session ${st.sessionId}`);
+        logInfo("CTRL session started", { cid, sessionId: st.sessionId });
       } catch (e) {
         ws.send(
           JSON.stringify({ type: "error", error: "session_create_failed" })
         );
+        logError("CTRL session start failed", e, { cid });
       }
       return;
     }
 
     if (msg.type === "end") {
-      console.log(`[CTRL ${cid}] END requested`);
+      logInfo("CTRL end requested", { cid });
       st.ended = true;
 
       // push trailing buffer to Whisper
@@ -280,56 +482,102 @@ wssControl.on("connection", (ws, _req, cid) => {
         writeWav16kMonoPCM16(st.cur, wav);
         const idx = st.segIdx++;
         const generation = st.transcriptionGen;
-        const job = spawnWhisperOnce(wav).then((text) => {
-          if (st.transcriptionGen !== generation) return;
-          st.results.push({ idx, text: (text || "").trim() });
-        });
+        const job = spawnWhisperOnce(wav)
+          .then((text) => {
+            if (st.transcriptionGen !== generation) return;
+            const cleaned = normalizeWhisperText(text);
+            if (!cleaned) {
+              logDebug("Skipping non-speech trailing segment", { cid, idx, raw: text });
+              return;
+            }
+            st.results.push({ idx, text: cleaned });
+          })
+          .catch((err) => {
+            if (st.transcriptionGen !== generation) return;
+            logError("Whisper trailing segment failed", err, { cid, idx });
+          });
         st.jobs.push(job);
         st.cur = new Uint8Array(0);
       }
 
-      Promise.allSettled(st.jobs).then(() => {
-        const segments = st.results.slice().sort((a, b) => a.idx - b.idx);
+      Promise.allSettled(st.jobs).then((results) => {
+        const failures = results.filter((r) => r.status === "rejected");
+        if (failures.length) {
+          logError(
+            "One or more Whisper jobs failed",
+            new Error("whisper_failed"),
+            {
+              cid,
+              failures: failures.map((f) => f.reason?.message || "unknown"),
+            }
+          );
+        }
+        const segments = st.results
+          .slice()
+          .sort((a, b) => a.idx - b.idx)
+          .filter((seg) => seg.text);
         const transcript = segments
           .map((r) => r.text)
           .join(" ")
           .replace(/\s+/g, " ")
           .trim();
-        try {
-          ws.send(JSON.stringify({ type: "final_asr", text: transcript }));
-        } catch {}
+        const wordTotal = countWords(transcript);
 
-        if (transcript && st.sessionId) {
-          console.log(
-            `[LLM] Trigger session=${st.sessionId} transcript_len=${transcript.length}`
-          );
-          // call FastAPI and proxy SSE back to this control socket
-          pipeLLM({ sessionId: st.sessionId, question: transcript, ws });
+        if (wordTotal < MIN_TRANSCRIPT_WORDS) {
+          logDebug("Transcript below minimum words", {
+            cid,
+            wordTotal,
+            transcript,
+          });
+          try {
+            ws.send(JSON.stringify({ type: "final_asr", text: "" }));
+          } catch {}
+
+          try {
+            ws.send(
+              JSON.stringify({
+                type: "llm",
+                event: "done",
+                data: { reason: "insufficient_words", wordTotal },
+              })
+            );
+          } catch {}
         } else {
-          console.log(
-            `[LLM] Skip trigger session=${st.sessionId} transcript_len=${transcript.length}`
-          );
+          try {
+            ws.send(JSON.stringify({ type: "final_asr", text: transcript }));
+          } catch {}
+
+          if (st.sessionId) {
+            logInfo("Triggering LLM", {
+              sessionId: st.sessionId,
+              wordTotal,
+              transcriptLength: transcript.length,
+            });
+            // call FastAPI and proxy SSE back to this control socket
+            pipeLLM({ sessionId: st.sessionId, question: transcript, ws });
+          }
         }
         resetTranscriptionBuffers(st);
+        st.jobs = [];
       });
       return;
     }
   });
 
   ws.on("close", () => {
-    console.log(`[CTRL ${cid}] CLOSE`);
+    logDebug("CTRL connection closed", { cid });
     const s = clients.get(cid);
     if (s) s.controlWS = null;
   });
 
   ws.on("error", (e) => {
-    console.log(`[CTRL ${cid}] ERROR`, e?.message || e);
+    logError("CTRL socket error", e, { cid });
   });
 });
 
 // AUDIO WS: binary PCM16 mono@16k only
 wssAudio.on("connection", (ws, _req, cid) => {
-  console.log(`[AUDIO ${cid}] OPEN`);
+  logDebug("AUDIO connection open", { cid });
   let st = clients.get(cid);
   if (!st) {
     st = newSessionState();
@@ -353,35 +601,59 @@ wssAudio.on("connection", (ws, _req, cid) => {
       st.cur = st.cur.subarray(SEG_BYTES);
 
       const generation = st.transcriptionGen;
-      const job = spawnWhisperOnce(wav).then((text) => {
-        if (st.transcriptionGen !== generation) return;
-        const cleaned = (text || "").trim();
-        st.results.push({ idx, text: cleaned });
-        if (!cleaned) return;
-        // optional: stream partial ASR back to UI
-        try {
-          st.controlWS?.send(
-            JSON.stringify({ type: "partial_asr", idx, text: cleaned })
-          );
-        } catch {}
-      });
+      const job = spawnWhisperOnce(wav)
+        .then((text) => {
+          if (st.transcriptionGen !== generation) return;
+          const cleaned = normalizeWhisperText(text);
+          if (!cleaned) {
+            logDebug("Skipping non-speech segment", { cid, idx, raw: text });
+            return;
+          }
+          st.results.push({ idx, text: cleaned });
+
+          const aggregate = st.results
+            .slice()
+            .sort((a, b) => a.idx - b.idx)
+            .map((seg) => seg.text)
+            .join(" ")
+            .replace(/\s+/g, " ")
+            .trim();
+          const words = countWords(aggregate);
+          if (words < MIN_TRANSCRIPT_WORDS) {
+            logDebug("Partial below minimum words", { cid, idx, words, aggregate });
+            return;
+          }
+
+          // optional: stream partial ASR back to UI
+          try {
+            st.controlWS?.send(
+              JSON.stringify({ type: "partial_asr", idx, text: aggregate })
+            );
+          } catch (err) {
+            logError("Failed to send partial ASR", err, { cid, idx });
+          }
+        })
+        .catch((err) => {
+          if (st.transcriptionGen !== generation) return;
+          logError("Whisper segment failed", err, { cid, idx });
+        });
       st.jobs.push(job);
     }
   });
 
   ws.on("close", () => {
-    console.log(`[AUDIO ${cid}] CLOSE`);
+    logDebug("AUDIO connection closed", { cid });
     const s = clients.get(cid);
     if (s) s.audioWS = null;
   });
 
   ws.on("error", (e) => {
-    console.log(`[AUDIO ${cid}] ERROR`, e?.message || e);
+    logError("AUDIO socket error", e, { cid });
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`[BOOT] Server http://localhost:${PORT}`);
-  console.log(`[BOOT] WS     ws://localhost:${PORT}/control?cid=...`);
-  console.log(`[BOOT] WS     ws://localhost:${PORT}/audio?cid=...`);
+  logInfo("Server boot", { port: PORT });
+  logInfo("WS control", { url: `ws://localhost:${PORT}/control?cid=...` });
+  logInfo("WS audio", { url: `ws://localhost:${PORT}/audio?cid=...` });
 });

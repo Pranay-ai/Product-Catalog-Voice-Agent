@@ -42,6 +42,13 @@ export function useCallSession() {
   const [finalText, setFinalText] = useState("");
   const [asr, setAsr] = useState("");
   const [log, setLog] = useState("");
+  const [userSpeaking, setUserSpeaking] = useState(false);
+  const userSpeakingRef = useRef(false);
+
+  const updateUserSpeaking = useCallback((val) => {
+    userSpeakingRef.current = val;
+    setUserSpeaking(val);
+  }, []);
 
   const lastVoiceTsRef = useRef(0);
   const SIL_MS = 1200;
@@ -54,8 +61,12 @@ export function useCallSession() {
   const openerSpokenRef = useRef("");
   const finalSpokenRef = useRef("");
 
-  const { speak, cancel: cancelSpeech, supported: ttsSupported } =
-    useSpeechSynthesis();
+  const {
+    speak,
+    cancel: cancelSpeech,
+    supported: ttsSupported,
+    speaking: botSpeaking,
+  } = useSpeechSynthesis();
 
   const speakText = useCallback(
     (text) => {
@@ -134,6 +145,7 @@ export function useCallSession() {
         openerSpokenRef.current = "";
         finalSpokenRef.current = "";
         cancelSpeech();
+        updateUserSpeaking(false);
       }
 
       if (closeSockets) {
@@ -147,7 +159,7 @@ export function useCallSession() {
         audioRef.current = null;
       }
     },
-    [cancelSpeech]
+    [cancelSpeech, updateUserSpeaking]
   );
 
   const finalizeTurn = useCallback(
@@ -203,7 +215,8 @@ export function useCallSession() {
     openerSpokenRef.current = "";
     finalSpokenRef.current = "";
     cancelSpeech();
-  }, [cancelSpeech, cleanup, dlog, status]);
+    updateUserSpeaking(false);
+  }, [cancelSpeech, cleanup, dlog, status, updateUserSpeaking]);
 
   const openControl = useCallback(() => {
     return new Promise((resolve, reject) => {
@@ -304,11 +317,12 @@ export function useCallSession() {
             if (m.event === "error") {
               dlog("llm error event");
               awaitingResponseRef.current = false;
-              hasAudioForTurnRef.current = false;
-              turnBaselineRef.current = transcriptHistoryRef.current;
-              if (isEndingRef.current) {
-                setStatus("error");
-                cleanup(true);
+        hasAudioForTurnRef.current = false;
+        turnBaselineRef.current = transcriptHistoryRef.current;
+        updateUserSpeaking(false);
+        if (isEndingRef.current) {
+          setStatus("error");
+          cleanup(true);
                 isEndingRef.current = false;
               } else {
                 setStatus("in_call");
@@ -407,6 +421,14 @@ export function useCallSession() {
         }
         lastVoiceTsRef.current = performance.now();
         hasAudioForTurnRef.current = true;
+        updateUserSpeaking(true);
+      }
+      if (
+        userSpeakingRef.current &&
+        performance.now() - lastVoiceTsRef.current > 200 &&
+        silent
+      ) {
+        updateUserSpeaking(false);
       }
       if (audioRef.current?.readyState === WebSocket.OPEN) {
         const pcm16 = downsampleTo16k(ch, ctx.sampleRate);
@@ -420,6 +442,7 @@ export function useCallSession() {
         performance.now() - lastVoiceTsRef.current > SIL_MS
       ) {
         finalizeTurn("silence");
+        updateUserSpeaking(false);
       }
     };
 
@@ -427,7 +450,7 @@ export function useCallSession() {
     sourceRef.current = source;
     processorRef.current = proc;
     streamRef.current = stream;
-  }, [cancelSpeech, dlog, finalizeTurn]);
+  }, [cancelSpeech, dlog, finalizeTurn, updateUserSpeaking]);
 
   const startCall = useCallback(async () => {
     setStatus("connecting");
@@ -443,6 +466,7 @@ export function useCallSession() {
     turnBaselineRef.current = "";
     openerSpokenRef.current = "";
     finalSpokenRef.current = "";
+    updateUserSpeaking(false);
 
     try {
       dlog("starting call: opening sockets");
@@ -461,7 +485,7 @@ export function useCallSession() {
       dlog("start error", e?.message || e.toString());
       cleanup();
     }
-  }, [cleanup, dlog, openAudio, openControl, startMic]);
+  }, [cleanup, dlog, openAudio, openControl, startMic, updateUserSpeaking]);
 
   useEffect(() => () => cleanup(true), [cleanup]);
 
@@ -474,5 +498,7 @@ export function useCallSession() {
     startCall,
     endCall,
     ttsSupported,
+    userSpeaking,
+    botSpeaking,
   };
 }
