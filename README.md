@@ -1,8 +1,3 @@
-# Product-Catalog-Voice-Agent
-
-Here’s a **complete README** for your project that explains the setup process step by step. I’ve tailored it to your repo’s structure (`fastapi-rag-llmpipeline`, `voicebot-nodejs-backend`, and `voicebot-frontend/web`). You can copy this directly into `README.md` at the root.
-
----
 
 # Product Catalog Voice Agent
 
